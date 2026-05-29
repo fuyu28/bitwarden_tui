@@ -116,42 +116,83 @@ type VaultRepository interface {
 
 | 関数 | rbw コマンド |
 |------|------------|
-| `IsUnlocked() bool` | `rbw unlocked` (exit code 0 = locked, 1 = unlocked ※要確認) |
+| `IsUnlocked() bool` | `rbw unlocked` (exit code 0 = unlocked, non-0 = locked ※要確認) |
 | `Unlock(password string) error` | `echo "<pw>" \| rbw unlock` |
 | `List() ([]model.ListItem, error)` | `rbw list --raw` |
 | `GetDetail(id string) (*model.Item, error)` | `rbw get <id> --raw` |
 | `Sync() error` | `rbw sync` |
 
-`GetDetail` で返す構造体には `Password` フィールドを含む（アプリ内で扱う）。
 TOTP の現在コード（6桁）は `rbw code <id>` で取得し `LoginDetail.TOTP` に格納する。`rbw get --raw` の totp フィールドはシークレットキーなので使わない。
+`GetDetail` は `rbw get <id> --raw` の name/folder/notes/data をすべてパースして `*model.Item` を返す。
 
-`rbw list --raw` のレスポンス例（実測）:
+`rbw list --raw` 実測レスポンス（各アイテム）:
 
 ```json
 { "id": "...", "name": "...", "user": "...", "folder": null, "uris": [...], "type": "Login" }
+{ "id": "...", "name": "...", "user": null,  "folder": null, "uris": null,  "type": "Note" }
+{ "id": "...", "name": "...", "user": null,  "folder": null, "uris": null,  "type": "Card" }
+{ "id": "...", "name": "...", "user": null,  "folder": null, "uris": null,  "type": "SSH Key" }
 ```
 
-`rbw get <id> --raw` の想定フィールド（type 別）:
+`rbw get <id> --raw` 実測レスポンス（type 別）:
 
-- **Login**: name, folder, username, password, totp, uris, notes
-- **Card**: name, folder, cardholder_name, number, brand, exp_month, exp_year, code, notes
-- **Note**: name, folder, notes
-- **Identity**: title, first_name, last_name, email, phone, ...
-- **SSH Key**: name, folder, private_key, public_key, fingerprint, notes
+**Login**:
+
+```json
+{ "id": "...", "folder": null, "name": "...",
+  "data": { "username": "...", "password": "...", "totp": null, "uris": [] },
+  "fields": [], "notes": null, "history": [] }
+```
+
+**Note**:
+
+```json
+{ "id": "...", "folder": null, "name": "...",
+  "data": null,
+  "fields": [], "notes": "...", "history": [] }
+```
+
+**SSH Key**:
+
+```json
+{ "id": "...", "folder": null, "name": "...",
+  "data": { "public_key": "...", "fingerprint": "...", "private_key": "..." },
+  "fields": [], "notes": null, "history": [] }
+```
+
+**Card**:
+
+```json
+{ "id": "...", "folder": null, "name": "...",
+  "data": { "cardholder_name": "...", "number": "...", "brand": "...", "exp_month": "...", "exp_year": "...", "code": "..." },
+  "fields": [], "notes": null, "history": [] }
+```
+
+- `notes` はトップレベル（`data` の中ではない）、全タイプに存在（未設定時は `null`）
+- Note のみ `data: null`（コンテンツはすべて `notes` に入る）
+- type 文字列: `"Login"`, `"Note"`, `"Card"`, `"SSH Key"`（スペースあり）
 
 ### Step 4 — データモデル (`internal/model/item.go`)
 
 ```go
 type ItemType string
-const (TypeLogin, TypeCard, TypeNote, TypeIdentity, TypeSSH ItemType = ...)
+const (
+    TypeLogin    ItemType = "Login"
+    TypeNote     ItemType = "Note"
+    TypeCard     ItemType = "Card"
+    TypeSSH      ItemType = "SSH Key"   // スペースあり
+    TypeIdentity ItemType = "Identity"
+)
 
-type ListItem struct { ID, Name, Folder string; User string; Type ItemType }  // Folder は将来のフォルダナビ用に保持
-type LoginDetail    struct { Username, Password, TOTP string; URIs []string; Notes string }
-type CardDetail     struct { CardholderName, Number, Brand, ExpMonth, ExpYear, Code, Notes string }
-type NoteDetail     struct { Notes string }
+type ListItem struct { ID, Name, Folder string; User string; Type ItemType }  // Folder: null → "" (未設定)、将来のフォルダナビ用に保持
+
+// notes はトップレベルフィールドなので全タイプ共通で Item に持たせる（null = 未設定）
+type LoginDetail    struct { Username, Password, TOTP string; URIs []string }
+type CardDetail     struct { CardholderName, Number, Brand, ExpMonth, ExpYear, Code string }
+type NoteDetail     struct{}  // コンテンツは Item.Notes のみ
 type IdentityDetail struct { FullName, Email, Phone, Address string }
-type SSHKeyDetail   struct { PrivateKey, PublicKey, Fingerprint, Notes string }
-type Item struct { ListItem; Detail any }
+type SSHKeyDetail   struct { PrivateKey, PublicKey, Fingerprint string }
+type Item struct { ListItem; Notes string; Detail any }
 ```
 
 ### Step 5 — UI コンポーネント
