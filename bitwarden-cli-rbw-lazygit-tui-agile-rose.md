@@ -104,7 +104,7 @@ go get github.com/charmbracelet/bubbletea \
 
 ```go
 type VaultRepository interface {
-    IsUnlocked() bool
+    IsUnlocked() (bool, error)  // error = rbw 未インストール・実行失敗など異常系
     Unlock(password string) error
     List() ([]model.ListItem, error)
     GetDetail(id string) (*model.Item, error)
@@ -116,8 +116,8 @@ type VaultRepository interface {
 
 | 関数 | rbw コマンド |
 |------|------------|
-| `IsUnlocked() bool` | `rbw unlocked` (exit code 0 = unlocked, non-0 = locked ※要確認) |
-| `Unlock(password string) error` | `echo "<pw>" \| rbw unlock` |
+| `IsUnlocked() (bool, error)` | `rbw unlocked` (exit code 0 = unlocked, non-0 = locked ※要確認) |
+| `Unlock(password string) error` | `exec.Command("rbw", "unlock")` + `StdinPipe` に `password+"\n"` を書き込む |
 | `List() ([]model.ListItem, error)` | `rbw list --raw` |
 | `GetDetail(id string) (*model.Item, error)` | `rbw get <id> --raw` |
 | `Sync() error` | `rbw sync` |
@@ -201,7 +201,7 @@ type Item struct { ListItem; Notes string; Detail any }
 
 - `tea.Model` を実装
 - 状態: `items []model.ListItem`, `selected *model.Item`, `focus` (left/right), `typeFilter ItemType`
-- `Init()`: `VaultRepository.List()` を非同期 `tea.Cmd` で実行
+- `Init()`: 初期状態が `StateMain` のときだけ `VaultRepository.List()` を非同期 `tea.Cmd` で実行（`StateUnlock` 時は呼ばない）
 - アイテム選択時に `VaultRepository.GetDetail()` を非同期で呼び出し
 
 **`ui/list.go`** — 左ペイン
@@ -234,7 +234,7 @@ q/Ctrl+C   終了
 
 ### Step 6 — アンロック画面 (`ui/unlock.go`)
 
-- `bubbles/textinput`（EchoModePassword でマスク入力）
+- `bubbles/textinput`（`EchoModePassword` でマスク入力、画面には `•` で表示）
 - Enter で `VaultRepository.Unlock(password)` を呼び出し、成功でメイン画面へ切り替え
 - 失敗時はエラーメッセージ再表示
 
@@ -271,7 +271,8 @@ tea.NewProgram(ui.NewApp(vaultRepo, clipRepo)).Run()
 // repository/clipboard.go
 type ClipboardRepository interface {
     Copy(value string) error
-    CopySensitive(value string) error  // 機密用（履歴で伏せ表示）
+    CopySensitive(value string) error  // 機密用（copyq なら履歴で伏せ表示、fallback は通常コピー）
+    SupportsHiddenCopy() bool          // copyq あり→true、fallback→false
 }
 ```
 
@@ -283,42 +284,46 @@ type ClipboardRepository interface {
 copyq write 0 "application/x-copyq-hidden" "1" "text/plain" "<value>"
 ```
 
+`SupportsHiddenCopy()` は `true` を返す。
+
 #### copyq が **ない** 場合（`infra/clipboard/fallback.go`）
 
-`atotto/clipboard` で標準クリップボードに書き込む。
-ただし機密フィールドのコピー時は **確認ダイアログを表示**:
+`CopySensitive` は `atotto/clipboard` で通常コピーするだけ（infra は UI を持たない）。
+`SupportsHiddenCopy()` は `false` を返す。
+
+**確認ダイアログは UI 側の責務**:
+`detail.go` で `y` キー押下時に `clipRepo.SupportsHiddenCopy() == false` なら警告を表示し、
+再度 `y` で確定後に `CopySensitive` を呼ぶ。
 
 ```
-copyq が見つかりません。
-クリップボード履歴に平文で保存されます。
+copyq が見つかりません。クリップボード履歴に平文で保存されます。
 続けますか？ [y/N]
 ```
-
-`y` で確定コピー、それ以外でキャンセル。
 
 #### 起動時の検出と DI
 
 ```go
 // main.go
 var clipRepo repository.ClipboardRepository
-if isCopyqAvailable() {  // exec.LookPath("copyq") で判定
+if _, err := exec.LookPath("copyq"); err == nil {
     clipRepo = copyq.NewClient()
 } else {
     clipRepo = clipboard.NewFallback()
 }
-ui.NewApp(vaultRepo, clipRepo)
+tea.NewProgram(ui.NewApp(vaultRepo, clipRepo)).Run()
 ```
 
-非機密フィールド（username, URI, Note 本文など）はどちらの実装でも確認なしでコピー。
+非機密フィールド（username, URI, Note 本文など）は `Copy()` を使い確認なしでコピー。
 
 ---
 
 ## 起動フロー（マスターパスワード要求）
 
 1. 起動時に `VaultRepository.IsUnlocked()` チェック
-2. **ロック中** → TUI 内でパスワード入力プロンプト表示（bubbles/textinput、入力は `*` でマスク）
+   - `error != nil` → rbw 未インストール・設定不備としてエラー表示して終了
+2. **ロック中（`false, nil`）** → `StateUnlock` に設定、TUI 内でパスワード入力プロンプト表示（`EchoModePassword`）
 3. 入力確定で `VaultRepository.Unlock(password)` を呼び出し
-4. アンロック成功 → メイン画面へ遷移
+4. アンロック成功 → `StateMain` に遷移、`VaultRepository.List()` を実行
 5. 失敗 → エラーメッセージ表示 → 再入力
 
 ---
@@ -331,13 +336,14 @@ ui.NewApp(vaultRepo, clipRepo)
 | Card | name, cardholder_name, brand, exp_month/year, notes | number, code/PIN |
 | Note | name, notes（行単位コピー対応） | — |
 | SSH Key | name, public_key, fingerprint, notes | private_key |
-| Identity | title, full_name, email, phone, address | — |
+| Identity | （今回対象外） | — |
 
 ---
 
 ## 実装しない機能（今回）
 
 - アイテムの追加・編集・削除
+- Identity タイプの表示（rbw 実測 JSON 未確認、フィルタ未割当のため）
 - フォルダーナビゲーション（将来: `f` キーで左ペインがフォルダ一覧に切り替わり `j/k` + `Enter` で選択する B 方式）
 
 ---
@@ -345,7 +351,7 @@ ui.NewApp(vaultRepo, clipRepo)
 ## 検証方法
 
 1. `go build -o bwtui . && ./bwtui` で起動確認
-2. `rbw unlocked` がロック状態のときにエラー終了するか確認
+2. ロック状態で起動するとアンロック画面が表示されること、マスターパスワード入力後にメイン画面へ遷移することを確認
 3. リスト表示 → タイプフィルタ切り替え → アイテム選択 → 詳細表示の一連フローを手動確認
 4. Note アイテムで行選択コピー（`y`）が正しくクリップボードに入るか確認
 5. Login アイテムのパスワードがデフォルトで `••••` になっていること、`space` で表示トグルできることを確認
